@@ -1,0 +1,10 @@
+# derived data, never knowledge
+graphify-out/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.ndjson
+!*.ndjson.example
+__pycache__/
+*.pyc
+.DS_Store
