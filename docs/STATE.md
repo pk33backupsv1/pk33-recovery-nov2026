@@ -183,4 +183,119 @@ DeepSeek keys are in play.
 
 ---
 
+## 10. 2026-11-02 late: the intake append fix (the CPU hog is now actually fixed)
+
+Audit #1 identified this defect on 30 Oct; it was **not fixed** then, and on
+2026-11-02 it was actively burning a core every 10 minutes at **96 °C**.
+
+### The defect
+
+`zcons1/ssot_engine/intake.py`:
+
+- `append()` computed the next seq with `_scan_max_seq()` — a **full read of
+  the whole log**.
+- `append_many()` called `append()` once per event → a 76-event feed rescanned
+  a **93 MB log 76 times**.
+- The rc log lives on an **HDD bind-mount** (`/dev/sda1`), so each rescan was
+  also a spin-disk read.
+
+### The fix (zcons1 `944d51b`, pushed to `zexp1/zcons1`; efus3 pointer `ccec0c63e`)
+
+| | OLD | NEW |
+|---|---|---|
+| `append_many(76)` on the real 93 MB log | **34.07 s** | **0.00 s** |
+| output | — | **byte-identical** (226,362 lines compared one by one) |
+
+Two changes, both keeping the ONE-WRITER LAW:
+
+1. **`_tail_max_seq()`** — the log is append-only and every append takes the
+   flock, so seqs increase *in file order* and the last parseable line carries
+   the max. Reading the last 64 KB gives the same answer at O(tail). It is used
+   **only when it proves the answer**: it returns `None` on a malformed or
+   unordered tail, and the caller then pays the full scan.
+2. **`append_many()` scans once per batch** and assigns base+1, base+2, … under
+   the same flock. A batch is now **atomic** where it previously was not —
+   strictly stronger.
+
+### Live proof (the same workload, one hour apart)
+
+| | tick | rc log written | elapsed |
+|---|---|---|---|
+| old code | 03:48:06 | 03:48:46 | **40 s** |
+| fixed code | 03:58:03 | 03:58:03 | **< 1 s** |
+
+The log grew by exactly 76 events (seq 226286 → 226361), strictly increasing,
+unique, no collision. **CPU package 96 °C → 34 °C.**
+
+### Tests
+
+`ssot_engine/tests/test_intake_append_perf.py` (new, 6 tests) pins the batch
+semantics, the one-scan-per-batch property, tail/full-scan agreement, the
+malformed-tail refusal, and atomicity. Suite: **22 passed**.
+
+The wider `tests/` suite is **unchanged** by the fix — 42 failed / 241 passed
+*both before and after* (pre-existing failures, verified by restoring the
+original `intake.py` and getting identical counts).
+
+### A historical defect found while verifying — NOT caused by this fix
+
+The rc log contains **2 duplicate seqs: 637 and 638**, each appearing twice,
+from **2026-07-02** — nine hours apart (`10:27` and `19:50`), both from
+`emitter:iops_deploy_dev`. Three months old; predates every change in this
+ledger.
+
+**Not fixed** — repairing historical seqs in a durable log is a separate,
+deliberate operation.
+
+---
+
+## 11. The `pk` registry — reconciled, not discarded
+
+Audit #4 called the 60 `pk` registry rows "a hostname you no longer have" and
+implied SUPERSEDED. **`pk` is live.** Full detail in `docs/FLEET-AUDIT.md`.
+
+- The 8 rows marked `DEAD-UNTRIAGED` are **running** on `pk`. That state means
+  "a human ruled on this, stop re-alarming" (CRON-DOCTRINE L5) — no such
+  ruling applies to jobs that are running.
+- The 6 rows marked `DISABLED` were verified **genuinely off** on `pk` — those
+  labels stand.
+- Corrected in both copies of the shared registry: pk `da607cb44`, pk33
+  `36804eccb`.
+- **Found on pk, not fixed from pk33:** 28 jobs run on pk but are registered
+  under machine `pk33` (their commands point at `/home/pk/`), so pk's `verify`
+  cannot see them and `heal` cannot repair them. Plus 57 `#PAUSED20260711`
+  comment lines — stable, not runaway (111 → 111 over 60 s).
+
+---
+
+## 12. B2 holds the ncerts corpus — the off-box tier is real
+
+```
+local  /home/pk33/zsm-ncert-20260919/ncert-pdfs : 1,025 files, 140,599,609,820 bytes
+B2     b2-remote:zsm-ncert/ncert-pdfs-20260919   : 1.025k objects, 140,599,609,820 bytes
+```
+
+**Byte-identical.** The 131 GB corpus is safely prunable or shiftable, and B2
+is a live off-box tier — unlike `aw:~/awgbackups`, which is **empty**.
+
+---
+
+## 13. The two dirty worktrees are preserved
+
+The 24 worktrees do **not** carry unmerged branch tips (their tips are
+ancestors of the SSOT at `311036bb`). Only **two** are dirty, and both are
+now preserved three ways:
+
+- branch tips pushed to the SSOT's GitHub as `archive/wip/pk33/*`
+  (`b45139ed2`, `a80d2039c`)
+- `git diff` patches of every tracked modification
+- verbatim copies of the 5 untracked files — **three of which exist nowhere
+  in the SSOT**
+
+See `references/worktree-salvage/README.md` for the restore commands.
+
+---
+
+---
+
 *Verified 2026-11-02 IST. All figures from live command output.*
