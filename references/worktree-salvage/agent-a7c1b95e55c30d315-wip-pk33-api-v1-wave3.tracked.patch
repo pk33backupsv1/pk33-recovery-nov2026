@@ -1,0 +1,40 @@
+diff --git a/docs/m217-zsm-curriculum/assessment-simulation-report.md b/docs/m217-zsm-curriculum/assessment-simulation-report.md
+index 20a33547..b49bb281 100644
+--- a/docs/m217-zsm-curriculum/assessment-simulation-report.md
++++ b/docs/m217-zsm-curriculum/assessment-simulation-report.md
+@@ -8,17 +8,17 @@ INFERRED from the (item, correct) responses via the DINA diagnosis posterior —
+ ## Slice answered
+ 
+ - strands: mat.g4, sci.g7, ela.g5, cs.g8 (subjects: cs, ela, mat, sci)
+-- KCs with items (engaged): 66
+-- items in the banks: 115 (all `reviewStatus:"pending"` → F11: 0 servable)
++- KCs with items (engaged): 73
++- items in the banks: 128 (all `reviewStatus:"pending"` → F11: 0 servable)
+ 
+ ## Inferred mastery vs latent ability (the engine measures ability)
+ 
+ | learner | latent θ | items answered | correct | mean INFERRED mastery | mean BKT mastery | recovery F1 | recovery Jaccard |
+ |---|---|---|---|---|---|---|---|
+-| L0 — high-ability agent (θ=+2.0) | 2.0 | 115 | 106 | 0.834 | 0.806 | 0.94 | 0.88 |
+-| L1 — upper-mid agent (θ=+0.7) | 0.7 | 115 | 67 | 0.534 | 0.634 | 0.69 | 0.52 |
+-| L2 — lower-mid agent (θ=−0.7) | -0.7 | 115 | 59 | 0.473 | 0.607 | 0.51 | 0.34 |
+-| L3 — low-ability agent (θ=−2.0) | -2.0 | 115 | 21 | 0.186 | 0.423 | 0.00 | 0.00 |
++| L0 — high-ability agent (θ=+2.0) | 2.0 | 128 | 117 | 0.831 | 0.807 | 0.93 | 0.88 |
++| L1 — upper-mid agent (θ=+0.7) | 0.7 | 128 | 76 | 0.546 | 0.643 | 0.70 | 0.54 |
++| L2 — lower-mid agent (θ=−0.7) | -0.7 | 128 | 65 | 0.469 | 0.606 | 0.48 | 0.32 |
++| L3 — low-ability agent (θ=−2.0) | -2.0 | 128 | 22 | 0.176 | 0.416 | 0.00 | 0.00 |
+ 
+ Latent-ability ordering θ(L0) > θ(L1) > θ(L2) > θ(L3) is recovered by the inferred-mastery ordering —
+ the item bank discriminates ability without any mastery being injected.
+@@ -28,9 +28,9 @@ the item bank discriminates ability without any mastery being injected.
+ | subject | KCs | high-agent (L0) mean | low-agent (L3) mean | discrimination Δ |
+ |---|---|---|---|---|
+ | cs | 9 | 0.770 | 0.247 | 0.523 |
+-| ela | 16 | 0.735 | 0.142 | 0.593 |
++| ela | 17 | 0.740 | 0.140 | 0.600 |
+ | mat | 26 | 0.881 | 0.159 | 0.722 |
+-| sci | 15 | 0.898 | 0.244 | 0.654 |
++| sci | 21 | 0.869 | 0.195 | 0.674 |
+ 
+ ## How items drive diagnosis (the exact mechanism)
+ 

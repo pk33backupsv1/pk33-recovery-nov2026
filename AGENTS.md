@@ -6,6 +6,34 @@ action you take is expected to be legible to whoever picks it up next.
 
 ---
 
+## 0. The canonical home — `pk33backupsv1` (pk's ruling, 2026-11-02)
+
+> **`pk33backupsv1` is the canonical GitHub home for pk33's seat work.
+> `awgbackups` is SKIPPED — do not create, push to, or migrate anything there.**
+
+**Why:** `awgbackups` has **zero members** and `pk-szt6` is not one of them, so
+it cannot be written from this box (`CreateRepository` is refused). It was
+created on 2026-10-30T21:14:14Z — 16 minutes before the first attempt against
+it — and has never been populated.
+
+**What this means operationally:**
+
+| | |
+|---|---|
+| **Canonical org** | **`pk33backupsv1`** — all three seat repos live here |
+| Canonical local root | `~/pk33backupsv1/` |
+| Local repos | `pk33-cleanup` · `pk33-recovery-nov2026` · `pk33-intelligence-recreate-nov2026` |
+| `awgbackups` | **skipped** — nothing to do there, do not retry against it |
+| `pk-szt6/pk33-cleanup` | a **stale mirror** from 2026-10-30/31 — superseded by `pk33backupsv1/pk33-cleanup`; do not push to it |
+
+**Audit trail:** the original repo was at `~/awgbackups/pk33-cleanup` with
+remote `pk-szt6/pk33-cleanup`. It was **shifted** (moved, not copied) to
+`~/pk33backupsv1/pk33-cleanup` with remote `pk33backupsv1/pk33-cleanup` on
+2026-11-02. Ledger row `4.12`.
+
+
+---
+
 ## 1. What this seat is
 
 pk33 is the **core working seat** of a LAN fleet. Work that appears to live

@@ -1,0 +1,765 @@
+diff --git a/.gitignore b/.gitignore
+index eb5224fc..21c28423 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -235,6 +235,10 @@ packages/**/dist/
+ .env
+ .env.*
+ 
++# Durable /learn learner state: the default PGlite data dir when ZSM_MASTER_KEK is set and ZSM_DATA_DIR is
++# not (see packages/api/src/learn-persistence.ts). RUNTIME state — learner events, never source, never tracked.
++.zsm-data/
++
+ # ssot engine runtime droppings (regenerable; spine+intake ARE committed)
+ ssot_engine_zsm1/*/spine.sqlite-wal
+ ssot_engine_zsm1/*/spine.sqlite-shm
+diff --git a/packages/api/README.md b/packages/api/README.md
+index e8ec3748..3a93fed7 100644
+--- a/packages/api/README.md
++++ b/packages/api/README.md
+@@ -153,7 +153,9 @@ Read-only. Part C's "theories (models/science)" concern, split so `/theories` se
+ ### learn — the runnable study loop (the capstone)
+ Drives the SEED-serve loop over HTTP: fold a learner's session → `decideAdaptive` → return the adaptive step
+ **with the real study material** (the delivered card `body_md` + the KC's items). Serves a demo strand
+-(`mat.g4`) loaded at startup. Learner ids are opaque **seed-sandbox** handles (in-memory, no DB, no real PII).
++(`mat.g4`) loaded at startup. Learner ids are opaque **seed-sandbox** handles (no real PII). State is
++**ephemeral by default** and **durable when `ZSM_MASTER_KEK` is set** — see
++[Learner state](#learner-state-ephemeral-vs-durable).
+ | Method | Path | Notes |
+ |---|---|---|
+ | GET | `/learn/next?learner=&strand=&mode=` | adaptive step + delivered card `body_md` + items; **seed-sim** (default) serves the pending body under a server-minted `SimContext` witness; `mode=production` **withholds all body/items** (F11) and returns routing only; `404` unknown strand |
+@@ -167,6 +169,27 @@ Drives the SEED-serve loop over HTTP: fold a learner's session → `decideAdapti
+ | GET | `/curriculum` | strands + per-KC card/item counts |
+ | GET | `/curriculum/:kcId` | topic metadata + its cards (incl. authored `body_md`) + items + review-queue status; `404` unknown KC |
+ 
++#### Learner state: ephemeral vs durable
++
++The `/learn/*` surface is identical in both modes; only survival differs.
++
++| | `ZSM_MASTER_KEK` unset (default) | `ZSM_MASTER_KEK` set |
++|---|---|---|
++| store | in-memory `Map` (`src/learn-store.ts`) | `@zsm/store` — PGlite Postgres, append-only `learner_event`, per-learner DEK, FORCE-RLS (`src/durable-learn-store.ts`) |
++| survives a restart | **no** | **yes**, from `ZSM_DATA_DIR` |
++| boot line | `[@zsm/api] learner state EPHEMERAL — set ZSM_MASTER_KEK for durability` | `[@zsm/api] learner state DURABLE — PGlite dataDir=…` |
++| crypto-shred | n/a | admin-only (`AppInstance.durable.erase`, no HTTP surface); a shredded learner answers **`410`** on every `/learn` route, and the anonymous population statistics are untouched |
++
++```bash
++# generate a key (keep it out of the repo — losing it means losing every learner's state, by design)
++export ZSM_MASTER_KEK=$(node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))")
++export ZSM_DATA_DIR=/var/lib/zsm/data
++pnpm --filter @zsm/api start
++```
++
++Mastery is reproduced EXACTLY across a restart, and durable mode folds with the same options as ephemeral
++mode, so switching the env never changes a learner's numbers (`test/durable-learn.test.ts`).
++
+ **F11 (structural, tested).** Every authored card/item is `reviewStatus:"pending"`. `/learn` delivers bodies
+ ONLY in **seed-sim** — an AI-agent simulation under a `SimContext` witness minted server-side that attests
+ **no real child is present** — via `deliverBodyInMode(..., "seed-sim", sim)`. A `?mode=production` request
+@@ -194,6 +217,8 @@ adapter (`src/node-adapter.ts`) — no extra server dependency. Config is env-on
+ | `HOST` | `127.0.0.1` | bind address (loopback by default; no external exposure) |
+ | `ZSM_API_CORS_ORIGINS` | unset (reads open, no cross-origin write) | comma-separated origin allowlist; `*`/unset ⇒ no explicit allowlist |
+ | `ZSM_API_KEYS` | unset (**dev mode**: writes open, unlocks closed) | `key:scope1\|scope2,key2:scope3` — see [Auth](#auth). Rotate by changing this and restarting |
++| `ZSM_MASTER_KEK` | unset (**ephemeral**: learner state dies with the process) | 32-byte master KEK as 64 hex chars or base64 ⇒ **durable** learner state. Malformed ⇒ **boot fails** (never a silent downgrade, never a default key). See [Learner state](#learner-state-ephemeral-vs-durable) |
++| `ZSM_DATA_DIR` | `.zsm-data/` (server; gitignored) | PGlite data directory for durable learner state. `:memory:` ⇒ durable semantics, no filesystem footprint |
+ 
+ This is a **source-only** workspace (every package's `exports` points at raw `./src/index.ts`), so there is
+ no `dist/` to `node`. Instead the server runs straight from TypeScript via Node's built-in type-stripping
+diff --git a/packages/api/package.json b/packages/api/package.json
+index 6e38bed4..4e3a518b 100644
+--- a/packages/api/package.json
++++ b/packages/api/package.json
+@@ -17,6 +17,7 @@
+     "@zsm/domain": "workspace:*",
+     "@zsm/serving": "workspace:*",
+     "@zsm/immune": "workspace:*",
++    "@zsm/store": "workspace:*",
+     "hono": "^4.6.14",
+     "zod": "^3.24.1"
+   }
+diff --git a/packages/api/src/app.ts b/packages/api/src/app.ts
+index 40688cd5..b842aa90 100644
+--- a/packages/api/src/app.ts
++++ b/packages/api/src/app.ts
+@@ -22,8 +22,27 @@ import { DEMO_PAGE_HTML } from "./demo-page.js";
+ import { createVerdictStore } from "./verdict-store.js";
+ import { ok, fail } from "./envelope.js";
+ import { ENGINE_PROV } from "./provenance.js";
++import { getDemoConfusability } from "./curriculum-source.js";
++import type { LearnStore } from "./learn-store.js";
++import { createDurableLearnStore, type DurableLearnStoreHandle } from "./durable-learn-store.js";
++import {
++  resolveLearnPersistence,
++  durableBootLine,
++  DEFAULT_DATA_DIR,
++  EPHEMERAL_BOOT_LINE,
++  type EnvLike,
++} from "./learn-persistence.js";
+ 
+-export const createApp = (): Hono => {
++export interface CreateAppOptions {
++  /**
++   * The `/learn/*` persistence port. OMITTED ⇒ the ephemeral in-memory learner store (unchanged default, and
++   * what every existing test gets). SUPPLIED ⇒ that store is used verbatim — this is the injection point the
++   * durable PGlite store arrives through, so the route group never learns which mode it is in.
++   */
++  readonly learnStore?: LearnStore;
++}
++
++export const createApp = (options: CreateAppOptions = {}): Hono => {
+   const app = new Hono();
+   const store = createVerdictStore();
+ 
+@@ -52,7 +71,7 @@ export const createApp = (): Hono => {
+   app.route("/theories", theoriesRoutes);
+   app.route("/evidence", evidenceRoutes);
+   app.route("/agents", makeAgentsRoutes(store));
+-  app.route("/learn", makeLearnRoutes());
++  app.route("/learn", options.learnStore ? makeLearnRoutes(options.learnStore) : makeLearnRoutes());
+   app.route("/curriculum", makeCurriculumRoutes());
+ 
+   app.notFound((c) => c.json(fail(`no route for ${c.req.method} ${c.req.path}`), 404));
+@@ -60,3 +79,57 @@ export const createApp = (): Hono => {
+ 
+   return app;
+ };
++
++// ── Env-driven assembly: the ONE place that decides durable vs ephemeral learner state ──────────────────────
++
++export interface AppInstance {
++  readonly app: Hono;
++  /** Which learner-state mode this instance booted in — computed from the env, never assumed. */
++  readonly mode: "durable" | "ephemeral";
++  /** The PGlite data dir in durable mode (`:memory:` when in-memory); null in ephemeral mode. */
++  readonly dataDir: string | null;
++  /** Release durable resources (a no-op in ephemeral mode). Safe to call more than once is NOT assumed. */
++  readonly close: () => Promise<void>;
++  /**
++   * Admin-only durable operations; null in ephemeral mode. Crypto-shred lives here and NOWHERE on the HTTP
++   * surface — mirroring @zsm/store's ServingEventStore/EventStore split (security review M3).
++   */
++  readonly durable: DurableLearnStoreHandle | null;
++}
++
++/**
++ * Build the app with the learner-state mode the ENVIRONMENT dictates, and SAY WHICH at boot.
++ *
++ *   ZSM_MASTER_KEK unset/empty ⇒ ephemeral (in-memory) + the loud EPHEMERAL_BOOT_LINE.
++ *   ZSM_MASTER_KEK set         ⇒ durable PGlite at ZSM_DATA_DIR (server default `.zsm-data/`).
++ *   ZSM_MASTER_KEK malformed   ⇒ THROWS. A typo'd key is a config error, never a silent downgrade.
++ *
++ * `log` is injectable so the boot line can be asserted by tests instead of eyeballed.
++ */
++export const createAppFromEnv = async (
++  env: EnvLike = process.env,
++  fallbackDataDir: string = DEFAULT_DATA_DIR,
++  log: (line: string) => void = console.warn,
++): Promise<AppInstance> => {
++  const persistence = resolveLearnPersistence(env, fallbackDataDir);
++
++  if (persistence.mode === "ephemeral") {
++    // LOUD by design: an operator who expected durability must not discover the truth from lost learner work.
++    log(EPHEMERAL_BOOT_LINE);
++    return { app: createApp(), mode: "ephemeral", dataDir: null, close: () => Promise.resolve(), durable: null };
++  }
++
++  const handle = await createDurableLearnStore({
++    kek: persistence.kek,
++    dataDir: persistence.dataDir,
++    confusability: getDemoConfusability(),
++  });
++  log(durableBootLine(persistence.dataDir));
++  return {
++    app: createApp({ learnStore: handle.store }),
++    mode: "durable",
++    dataDir: persistence.dataDir,
++    close: handle.close,
++    durable: handle,
++  };
++};
+diff --git a/packages/api/src/curriculum-source.ts b/packages/api/src/curriculum-source.ts
+index 5dd4802e..2d3ce56e 100644
+--- a/packages/api/src/curriculum-source.ts
++++ b/packages/api/src/curriculum-source.ts
+@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
+ import { dirname, resolve } from "node:path";
+ import {
+   parseLattice,
++  buildConfusabilityMap,
+   asKcId,
+   REVIEW_STATUS,
+   MEDIUM,
+@@ -26,6 +27,7 @@ import {
+   type ItemType,
+   type ItemDifficulty,
+   type RealizationEdge,
++  type ConfusabilityMap,
+ } from "@zsm/domain";
+ 
+ /** The demo strand driven by the /learn loop. A grade-4 math slice with authored cards + items on disk. */
+@@ -255,6 +257,20 @@ export const getCurriculum = (): DemoCurriculum => {
+   return cached;
+ };
+ 
++let cachedConfusability: ConfusabilityMap | null = null;
++
++/**
++ * The demo strand's inter-KC confusability relation, built ONCE from the loaded realization edges. Both the
++ * ephemeral and the durable learn stores fold with this SAME relation — the D2 interleaving coupling must not
++ * depend on which persistence mode the server booted in, or the two modes would report different mastery for
++ * the identical answer sequence.
++ */
++export const getDemoConfusability = (): ConfusabilityMap => {
++  if (cachedConfusability) return cachedConfusability;
++  cachedConfusability = buildConfusabilityMap(getCurriculum().realizationEdges);
++  return cachedConfusability;
++};
++
+ /** All learning cards centered on a KC (a KC may have several cards at different formats). */
+ export const cardsForKc = (curriculum: DemoCurriculum, kcId: KcId): readonly LearningCard[] =>
+   curriculum.cards.filter((c) => c.kcId === kcId);
+diff --git a/packages/api/src/index.ts b/packages/api/src/index.ts
+index 150c005b..35484ba6 100644
+--- a/packages/api/src/index.ts
++++ b/packages/api/src/index.ts
+@@ -2,7 +2,24 @@
+ // Validate-at-edge (Zod) -> call existing functions; F11 gates baked into the path; provenance on every
+ // response. Public exports: the app factory plus the contract types/schemas a caller may want to reuse.
+ 
+-export { createApp } from "./app.js";
++export { createApp, createAppFromEnv } from "./app.js";
++export type { CreateAppOptions, AppInstance } from "./app.js";
++// Durable `/learn/*` learner state (PGlite + crypto-shred + RLS) and the env contract that switches it on.
++export { createLearnStore, DEMO_PARAM_VERSION } from "./learn-store.js";
++export type { LearnStore, LearnStoreOptions } from "./learn-store.js";
++export { createDurableLearnStore, LearnerErasedError, DEFAULT_COHORT_CELL } from "./durable-learn-store.js";
++export type { DurableLearnStoreOptions, DurableLearnStoreHandle } from "./durable-learn-store.js";
++export {
++  resolveLearnPersistence,
++  parseMasterKek,
++  durableBootLine,
++  MASTER_KEK_ENV,
++  DATA_DIR_ENV,
++  DEFAULT_DATA_DIR,
++  IN_MEMORY_DATA_DIR,
++  EPHEMERAL_BOOT_LINE,
++} from "./learn-persistence.js";
++export type { LearnPersistence, EnvLike } from "./learn-persistence.js";
+ export type { Provenance, DataClass, Calibration } from "./provenance.js";
+ export { provenanceSchema, CONTENT_PROV, CORPUS_PROV, ENGINE_PROV, EVIDENCE_PROV, SPINE_PROV, LEARN_PROV, modelProv } from "./provenance.js";
+ export type { Envelope, ApiVersion } from "./envelope.js";
+diff --git a/packages/api/src/learn-store.ts b/packages/api/src/learn-store.ts
+index 3fa729b0..f9b7b0be 100644
+Binary files a/packages/api/src/learn-store.ts and b/packages/api/src/learn-store.ts differ
+diff --git a/packages/api/src/routes/learn.ts b/packages/api/src/routes/learn.ts
+index a2df1124..692fef7f 100644
+--- a/packages/api/src/routes/learn.ts
++++ b/packages/api/src/routes/learn.ts
+@@ -15,7 +15,6 @@ import {
+   deliverBodyInMode,
+   canServeItemInMode,
+   simContext,
+-  buildConfusabilityMap,
+   seedItemPrior,
+   SERVE_MODE,
+   NO_REAL_LEARNER_ATTESTATION,
+@@ -24,12 +23,22 @@ import {
+   type SessionView,
+   type KcId,
+   type LearnerEvent,
++  type LearnerStateBundle,
+   type ItemBankItem,
+ } from "@zsm/domain";
+ import { ok, fail, parseOrFail, readJson } from "../envelope.js";
+ import { LEARN_PROV } from "../provenance.js";
+-import { getCurriculum, cardsForKc, itemsForKc, DEMO_STRAND, type DemoCurriculum, type LearningCard } from "../curriculum-source.js";
++import {
++  getCurriculum,
++  getDemoConfusability,
++  cardsForKc,
++  itemsForKc,
++  DEMO_STRAND,
++  type DemoCurriculum,
++  type LearningCard,
++} from "../curriculum-source.js";
+ import { createLearnStore, type LearnStore } from "../learn-store.js";
++import { LearnerErasedError } from "../durable-learn-store.js";
+ import { requireScope } from "../auth.js";
+ 
+ // ── SimContext witness: minted ONCE, server-side, for the demo AI-agent fleet. Holding it is the only door to
+@@ -67,9 +76,9 @@ const trailingStreak = (events: readonly LearnerEvent[]): { consecWins: number;
+   return { consecWins, consecFails, lastOffered: last ? last.objectGuid : null };
+ };
+ 
+-const sessionViewFor = (store: LearnStore, learner: string): SessionView => {
+-  const state = store.stateFor(learner);
+-  const streak = trailingStreak(store.eventsFor(learner));
++const sessionViewFor = async (store: LearnStore, learner: string): Promise<SessionView> => {
++  const state = await store.stateFor(learner);
++  const streak = trailingStreak(await store.eventsFor(learner));
+   return {
+     mastered: state.knowledgeState,
+     lastOffered: streak.lastOffered,
+@@ -120,16 +129,27 @@ const deliveredItemView = (curriculum: DemoCurriculum, kcId: KcId, mode: ServeMo
+ const primaryCard = (curriculum: DemoCurriculum, kcId: KcId): LearningCard | null =>
+   cardsForKc(curriculum, kcId)[0] ?? null;
+ 
++// ── Erasure (durable mode only): a crypto-shredded learner is GONE, and the route says so ──────────────────
++// 410 Gone, not 404 and not an empty state: the learner's payloads were destroyed with their DEK (DR-25), so
++// there is no state to serve and never will be again. Returning a fresh zero-mastery bundle instead would
++// silently resurrect an erased child as a beginner. Unreachable in ephemeral mode (nothing can be shredded).
++
++const ERASED_STATUS = 410;
++
++const erasedFail = (learner: string): string =>
++  `learner '${learner}' has been erased (crypto-shred) — their state is unrecoverable by design`;
++
+ // ── Route group factory (own store + curriculum per app instance; no shared global mutable state) ──────────
+ 
+-export const makeLearnRoutes = (): Hono => {
++/**
++ * Build the /learn group. `store` is the persistence PORT: omitted ⇒ the ephemeral in-memory store (the
++ * long-standing sandbox default); supplied ⇒ whatever the app factory chose from the environment (the durable
++ * PGlite store). The HTTP surface is identical either way — the only observable difference is that a durable
++ * server's answers are still there after a restart, and that a crypto-shredded learner answers 410.
++ */
++export const makeLearnRoutes = (store: LearnStore = createLearnStore({ confusability: getDemoConfusability() })): Hono => {
+   const learn = new Hono();
+   const curriculum = getCurriculum(); // loaded once at startup (mat.g4 demo slice)
+-  // Build the inter-KC confusability relation ONCE from the loaded curriculum's realization edges, so interleaved
+-  // practice of confusable siblings (shared deep root) earns its durable-memory bonus in the served loop. Empty
+-  // edges ⇒ an empty relation ⇒ the fold reduces exactly as before (additive; F11 + existing behavior preserved).
+-  const confusability = buildConfusabilityMap(curriculum.realizationEdges);
+-  const store = createLearnStore({ confusability });
+ 
+   const nextQuery = z.object({
+     learner: z.string().min(1, "learner is required"),
+@@ -138,7 +158,7 @@ export const makeLearnRoutes = (): Hono => {
+   });
+ 
+   // GET /learn/next — the adaptive step + real study material (seed-sim), or routing-only (production).
+-  learn.get("/next", (c) => {
++  learn.get("/next", async (c) => {
+     const parsed = parseOrFail(c, nextQuery, {
+       ...(c.req.query("learner") !== undefined ? { learner: c.req.query("learner") } : {}),
+       ...(c.req.query("strand") !== undefined ? { strand: c.req.query("strand") } : {}),
+@@ -152,8 +172,15 @@ export const makeLearnRoutes = (): Hono => {
+     }
+ 
+     const mode = resolveMode(rawMode);
+-    const view = sessionViewFor(store, learner);
+-    const state = store.stateFor(learner);
++    let view: SessionView;
++    let state: LearnerStateBundle;
++    try {
++      view = await sessionViewFor(store, learner);
++      state = await store.stateFor(learner);
++    } catch (err) {
++      if (err instanceof LearnerErasedError) return c.json(fail(erasedFail(learner), LEARN_PROV), ERASED_STATUS);
++      throw err;
++    }
+ 
+     const decision = decideAdaptive({ lattice: curriculum.lattice, view, masteryProb: state.masteryProb, dueReviews: [] });
+     const targetKc = decision.targetKc;
+@@ -243,10 +270,17 @@ export const makeLearnRoutes = (): Hono => {
+     const item = curriculum.items.find((i) => i.item_id === item_id);
+     if (!item) return c.json(fail(`unknown item '${item_id}'`, LEARN_PROV), 400);
+ 
+-    const before = store.stateFor(learner).masteryProb.get(item.kc_id) ?? 0;
+-    const events = store.recordAnswer(learner, item.kc_id, correct);
+-    const after = store.stateFor(learner);
+-    const masteryProb = after.masteryProb.get(item.kc_id) ?? 0;
++    let before: number;
++    let events: number;
++    let masteryProb: number;
++    try {
++      before = (await store.stateFor(learner)).masteryProb.get(item.kc_id) ?? 0;
++      events = await store.recordAnswer(learner, item.kc_id, correct);
++      masteryProb = (await store.stateFor(learner)).masteryProb.get(item.kc_id) ?? 0;
++    } catch (err) {
++      if (err instanceof LearnerErasedError) return c.json(fail(erasedFail(learner), LEARN_PROV), ERASED_STATUS);
++      throw err;
++    }
+ 
+     return c.json(
+       ok(
+@@ -268,14 +302,22 @@ export const makeLearnRoutes = (): Hono => {
+   const stateQuery = z.object({ learner: z.string().min(1, "learner is required") });
+ 
+   // GET /learn/state — the learner's folded mastery/progress across all touched KCs.
+-  learn.get("/state", (c) => {
++  learn.get("/state", async (c) => {
+     const parsed = parseOrFail(c, stateQuery, {
+       ...(c.req.query("learner") !== undefined ? { learner: c.req.query("learner") } : {}),
+     });
+     if (!parsed.ok) return parsed.response;
+     const { learner } = parsed.value;
+ 
+-    const state = store.stateFor(learner);
++    let state: LearnerStateBundle;
++    let eventsRecorded: number;
++    try {
++      state = await store.stateFor(learner);
++      eventsRecorded = (await store.eventsFor(learner)).length;
++    } catch (err) {
++      if (err instanceof LearnerErasedError) return c.json(fail(erasedFail(learner), LEARN_PROV), ERASED_STATUS);
++      throw err;
++    }
+     const mastery = [...state.masteryProb.entries()].map(([kcId, masteryProb]) => {
+       // Surface the durable FSRS memory cell alongside the BKT posterior: the D2 couplings (scaffold→learning
+       // attenuation and inter-KC interleaving discrimination bonus) ride the durable-memory `stability` channel,
+@@ -296,7 +338,7 @@ export const makeLearnRoutes = (): Hono => {
+         {
+           learner,
+           strand: curriculum.strand,
+-          eventsRecorded: store.eventsFor(learner).length,
++          eventsRecorded,
+           mastery,
+           masteredCount: state.knowledgeState.size,
+           touchedKcs: mastery.length,
+diff --git a/packages/api/src/server.ts b/packages/api/src/server.ts
+index f1948ac1..b8d0d8cb 100644
+--- a/packages/api/src/server.ts
++++ b/packages/api/src/server.ts
+@@ -6,7 +6,7 @@
+ // TypeScript loader shim) rather than `node dist/server.js`; see the package README.
+ 
+ import { fileURLToPath } from "node:url";
+-import { createApp } from "./app.js";
++import { createAppFromEnv } from "./app.js";
+ import { serveApp, type ServerHandle } from "./node-adapter.js";
+ 
+ const DEFAULT_PORT = 8787;
+@@ -27,12 +27,25 @@ export interface StartOptions {
+   readonly host?: string;
+ }
+ 
+-/** Build the app and start serving. Resolves once the socket is bound (with the actual, possibly-ephemeral port). */
+-export const startServer = (options: StartOptions = {}): Promise<ServerHandle> => {
++/**
++ * Build the app and start serving. Resolves once the socket is bound (with the actual, possibly-ephemeral port).
++ *
++ * The app is built from the ENVIRONMENT (`createAppFromEnv`), so the learner-state mode is decided — and
++ * announced — at boot: ephemeral by default, durable when ZSM_MASTER_KEK is configured. The returned handle's
++ * `close()` also releases the durable store, so a shutdown does not leave PGlite holding the data dir.
++ */
++export const startServer = async (options: StartOptions = {}): Promise<ServerHandle> => {
+   const port = options.port ?? resolvePort(process.env["PORT"]);
+   const host = options.host ?? process.env["HOST"] ?? DEFAULT_HOST;
+-  const app = createApp();
+-  return serveApp(app, { port, host });
++  const instance = await createAppFromEnv();
++  const handle = await serveApp(instance.app, { port, host });
++  return {
++    ...handle,
++    close: async () => {
++      await handle.close();
++      await instance.close();
++    },
++  };
+ };
+ 
+ /**
+diff --git a/packages/api/tsconfig.json b/packages/api/tsconfig.json
+index c46affb8..b9798cc9 100644
+--- a/packages/api/tsconfig.json
++++ b/packages/api/tsconfig.json
+@@ -10,7 +10,8 @@
+   "references": [
+     { "path": "../domain" },
+     { "path": "../serving" },
+-    { "path": "../immune" }
++    { "path": "../immune" },
++    { "path": "../store" }
+   ],
+   "include": ["src/**/*.ts"]
+ }
+diff --git a/packages/store/src/db.ts b/packages/store/src/db.ts
+index 050164b1..ab2067ed 100644
+--- a/packages/store/src/db.ts
++++ b/packages/store/src/db.ts
+@@ -10,9 +10,27 @@ import { SCHEMA_DDL } from "./ddl.js";
+ 
+ export type ZsmDb = PgliteDatabase<typeof schema> & { $client: PGlite };
+ 
+-/** Create a fresh in-memory database with the v2a1 schema applied. */
+-export async function createDb(): Promise<ZsmDb> {
+-  const client = new PGlite();
++/** The explicit "no file, keep it in RAM" data dir (PGlite's own spelling). */
++export const IN_MEMORY_DATA_DIR = ":memory:";
++
++export interface CreateDbOptions {
++  /**
++   * Filesystem directory PGlite persists into. ABSENT (or `:memory:`) ⇒ a fresh in-memory database that
++   * dies with the process — the hermetic default every existing caller already relies on. A path ⇒ the
++   * database SURVIVES process restarts, which is the whole point of the durable serving path.
++   */
++  readonly dataDir?: string;
++}
++
++/**
++ * Create a database with the v2a1 schema applied. Re-opening an existing `dataDir` is safe and expected:
++ * `SCHEMA_DDL` is entirely `CREATE ... IF NOT EXISTS`, so applying it to an already-populated data dir is
++ * a no-op that leaves every row in place (the append-only log is never rebuilt).
++ */
++export async function createDb(options: CreateDbOptions = {}): Promise<ZsmDb> {
++  const dataDir = options.dataDir;
++  const client =
++    dataDir === undefined || dataDir === IN_MEMORY_DATA_DIR ? new PGlite() : new PGlite(dataDir);
+   const db = drizzle(client, { schema }) as ZsmDb;
+   await client.exec(SCHEMA_DDL);
+   return db;
+diff --git a/packages/store/src/eventStore.ts b/packages/store/src/eventStore.ts
+index a0b7247c..e25b88ed 100644
+--- a/packages/store/src/eventStore.ts
++++ b/packages/store/src/eventStore.ts
+@@ -11,9 +11,13 @@ import {
+   fold,
+   asKcId,
+   REDUCER_CLASS,
++  type EncodingMode,
++  type FeedbackTiming,
+   type LearnerEvent,
+   type LearnerStateBundle,
++  type Metacognition,
+   type ParamVersion,
++  type Scaffolding,
+   type Tombstone,
+   type XapiVerb,
+ } from "@zsm/domain";
+@@ -28,22 +32,84 @@ type Tx = Parameters<Parameters<ZsmDb["transaction"]>[0]>[0];
+ const isXapiVerb = (v: string): v is XapiVerb =>
+   Object.prototype.hasOwnProperty.call(REDUCER_CLASS, v);
+ 
++/**
++ * Thrown when a learner has ciphertext rows but no DEK — i.e. they were crypto-shredded (DR-25) and the
++ * payloads are unrecoverable BY DESIGN. A typed error so callers can distinguish "erased" from "the
++ * database is broken" without string-matching a message.
++ */
++export class LearnerErasedError extends Error {
++  readonly learnerRef: string;
++  constructor(learnerRef: string) {
++    super(`store: learner ${learnerRef} is erased (no DEK)`);
++    this.name = "LearnerErasedError";
++    this.learnerRef = learnerRef;
++  }
++}
++
++// ── Optional signal fields of LearnerEvent (scaffold / metacognition / encoding / feedback) ────────────────
++// Each one CHANGES THE FOLD (learn-rate scaling), so dropping them on persist would make a reloaded log fold
++// to different mastery than the live one. They are validated on decode against allow-lists that are checked
++// for EXHAUSTIVENESS at compile time: adding a member to any of these unions upstream makes `_exhaustive`
++// below stop type-checking, so a new signal can never be silently truncated on the durable path.
++
++const SCAFFOLDINGS = ["worked-example", "faded", "independent"] as const;
++const METACOGNITIONS = ["none", "self-explained", "self-regulated"] as const;
++const ENCODING_MODES = ["generated", "received"] as const;
++const FEEDBACK_TIMINGS = ["immediate", "delayed", "none"] as const;
++
++type NeverLeftOver<Union, Listed> = [Exclude<Union, Listed>] extends [never] ? true : never;
++const _exhaustive: [
++  NeverLeftOver<Scaffolding, (typeof SCAFFOLDINGS)[number]>,
++  NeverLeftOver<Metacognition, (typeof METACOGNITIONS)[number]>,
++  NeverLeftOver<EncodingMode, (typeof ENCODING_MODES)[number]>,
++  NeverLeftOver<FeedbackTiming, (typeof FEEDBACK_TIMINGS)[number]>,
++] = [true, true, true, true];
++void _exhaustive;
++
++/** Decode one optional enum-valued field: absent ⇒ undefined; present-but-unknown ⇒ LOUD failure, never dropped. */
++function optionalEnum<T extends string>(
++  raw: unknown,
++  allowed: readonly T[],
++  field: string,
++): T | undefined {
++  if (raw === undefined) return undefined;
++  if (typeof raw !== "string" || !(allowed as readonly string[]).includes(raw)) {
++    throw new Error(`store: bad ${field} in payload: ${JSON.stringify(raw)}`);
++  }
++  return raw as T;
++}
++
+ /** AAD binds a payload blob to its row identity so it cannot be relocated under the same key (H1). */
+ const aadFor = (learnerRef: string, eventId: string): Buffer =>
+   Buffer.from(`${learnerRef}:${eventId}`, "utf8");
+ 
+-/** The encrypted "what happened" payload — the part that must vanish on crypto-shred. */
++/**
++ * The encrypted "what happened" payload — the part that must vanish on crypto-shred. It carries EVERY
++ * non-structural field of `LearnerEvent`, including the optional learning-signal fields: each of them
++ * modulates the fold's learn rate, so a payload that dropped them would replay to different mastery.
++ * Optional fields are OMITTED when absent, so payloads written before they existed decode unchanged.
++ */
+ interface EventPayload {
+   readonly latticeEpoch: number;
+   readonly verb: XapiVerb;
+   readonly correct?: boolean;
++  readonly scaffold?: Scaffolding;
++  readonly metacognition?: Metacognition;
++  readonly encoding?: EncodingMode;
++  readonly feedback?: FeedbackTiming;
+ }
+ 
+ function encodePayload(e: LearnerEvent): Buffer {
+-  const p: EventPayload =
+-    e.correct === undefined
+-      ? { latticeEpoch: e.latticeEpoch, verb: e.verb }
+-      : { latticeEpoch: e.latticeEpoch, verb: e.verb, correct: e.correct };
++  // exactOptionalPropertyTypes: attach each optional field ONLY when the event actually carries it.
++  const p: EventPayload = {
++    latticeEpoch: e.latticeEpoch,
++    verb: e.verb,
++    ...(e.correct !== undefined ? { correct: e.correct } : {}),
++    ...(e.scaffold !== undefined ? { scaffold: e.scaffold } : {}),
++    ...(e.metacognition !== undefined ? { metacognition: e.metacognition } : {}),
++    ...(e.encoding !== undefined ? { encoding: e.encoding } : {}),
++    ...(e.feedback !== undefined ? { feedback: e.feedback } : {}),
++  };
+   return Buffer.from(JSON.stringify(p), "utf8");
+ }
+ 
+@@ -53,16 +119,32 @@ function decodePayload(buf: Buffer): EventPayload {
+   const o = raw as Record<string, unknown>;
+   if (typeof o.verb !== "string" || !isXapiVerb(o.verb)) throw new Error("store: bad verb in payload");
+   if (typeof o.latticeEpoch !== "number") throw new Error("store: bad latticeEpoch in payload");
+-  return typeof o.correct === "boolean"
+-    ? { latticeEpoch: o.latticeEpoch, verb: o.verb, correct: o.correct }
+-    : { latticeEpoch: o.latticeEpoch, verb: o.verb };
++  if (o.correct !== undefined && typeof o.correct !== "boolean") {
++    throw new Error("store: bad correct in payload");
++  }
++  const scaffold = optionalEnum(o.scaffold, SCAFFOLDINGS, "scaffold");
++  const metacognition = optionalEnum(o.metacognition, METACOGNITIONS, "metacognition");
++  const encoding = optionalEnum(o.encoding, ENCODING_MODES, "encoding");
++  const feedback = optionalEnum(o.feedback, FEEDBACK_TIMINGS, "feedback");
++  return {
++    latticeEpoch: o.latticeEpoch,
++    verb: o.verb,
++    ...(typeof o.correct === "boolean" ? { correct: o.correct } : {}),
++    ...(scaffold !== undefined ? { scaffold } : {}),
++    ...(metacognition !== undefined ? { metacognition } : {}),
++    ...(encoding !== undefined ? { encoding } : {}),
++    ...(feedback !== undefined ? { feedback } : {}),
++  };
+ }
+ 
+ /** The serving-safe surface — NO erase (security review M3: erasure is an admin-only operation). */
+ export interface ServingEventStore {
+   /** Append events under a paramVersion. Idempotent on (learnerRef, eventId). Encrypts under the learner DEK. */
+   append(events: readonly LearnerEvent[], paramVersion: ParamVersion): Promise<void>;
+-  /** Load + decrypt a learner's events. Throws if the learner has been crypto-shredded. */
++  /**
++   * Load + decrypt a learner's events. Empty for a learner who has never been seen; throws
++   * `LearnerErasedError` for one who has been crypto-shredded (the same distinction `loadState` makes).
++   */
+   loadEvents(learnerRef: string): Promise<LearnerEvent[]>;
+   /** Load → decrypt → fold. A shredded learner folds to TOMBSTONE; a never-existed one to empty state. */
+   loadState(learnerRef: string, paramVersion: ParamVersion): Promise<LearnerStateBundle | Tombstone>;
+@@ -121,15 +203,21 @@ export function makeEventStore(db: ZsmDb, masterKek: Buffer): EventStore {
+       const p = decodePayload(
+         open(dek, { ct: row.payloadCt, iv: row.payloadIv, tag: row.payloadTag }, aadFor(learnerRef, row.eventId)),
+       );
+-      const base = {
++      // exactOptionalPropertyTypes: rebuild the event with ONLY the optional fields that were persisted,
++      // so an event with no scaffold reloads as an event with no scaffold (not `scaffold: undefined`).
++      return {
+         eventId: row.eventId,
+         ingestSeq: row.ingestSeq,
+         latticeEpoch: p.latticeEpoch,
+         learnerRef: row.learnerRef,
+         verb: p.verb,
+         objectGuid: asKcId(row.objectGuid),
+-      };
+-      return p.correct === undefined ? base : { ...base, correct: p.correct };
++        ...(p.correct !== undefined ? { correct: p.correct } : {}),
++        ...(p.scaffold !== undefined ? { scaffold: p.scaffold } : {}),
++        ...(p.metacognition !== undefined ? { metacognition: p.metacognition } : {}),
++        ...(p.encoding !== undefined ? { encoding: p.encoding } : {}),
++        ...(p.feedback !== undefined ? { feedback: p.feedback } : {}),
++      } satisfies LearnerEvent;
+     });
+   }
+ 
+@@ -170,7 +258,14 @@ export function makeEventStore(db: ZsmDb, masterKek: Buffer): EventStore {
+     async loadEvents(learnerRef) {
+       return withLearner(db, learnerRef, async (tx) => {
+         const dek = await fetchDek(tx, learnerRef);
+-        if (!dek) throw new Error(`store: learner ${learnerRef} is erased (no DEK)`);
++        if (!dek) {
++          // Same distinction `loadState` already makes, and for the same reason: no DEK + orphaned
++          // ciphertext = crypto-shredded (unrecoverable, a typed error); no DEK + no rows = a learner who
++          // has simply never been seen, whose log is legitimately EMPTY. Conflating them made every
++          // first-ever read of a new learner look like an erasure.
++          if (await hasEvents(tx, learnerRef)) throw new LearnerErasedError(learnerRef);
++          return [];
++        }
+         try {
+           return await decryptEvents(tx, learnerRef, dek);
+         } finally {
+diff --git a/packages/store/src/schema.ts b/packages/store/src/schema.ts
+index cd8cac50..02cfc160 100644
+--- a/packages/store/src/schema.ts
++++ b/packages/store/src/schema.ts
+@@ -44,7 +44,19 @@ export const learnerDek = pgTable("learner_dek", {
+ 
+ /** Cleartext columns of learner_event that carry contract fields. */
+ export const CLEARTEXT_CONTRACT_COLUMNS = ["event_id", "learner_ref", "ingest_seq", "object_guid"] as const;
+-/** Contract fields carried inside the encrypted payload blob. */
+-export const ENCRYPTED_CONTRACT_FIELDS = ["latticeEpoch", "verb", "correct"] as const;
++/**
++ * Contract fields carried inside the encrypted payload blob — i.e. every `LearnerEvent` field that is NOT a
++ * cleartext structural column. The four optional learning-signal fields belong here because each one modulates
++ * the fold's learn rate: a payload that dropped them would replay to DIFFERENT mastery than the live log.
++ */
++export const ENCRYPTED_CONTRACT_FIELDS = [
++  "latticeEpoch",
++  "verb",
++  "correct",
++  "scaffold",
++  "metacognition",
++  "encoding",
++  "feedback",
++] as const;
+ /** Infra/crypto columns (not part of the wire contract). */
+ export const INFRA_COLUMNS = ["ordinal", "param_version", "payload_ct", "payload_iv", "payload_tag"] as const;
+diff --git a/packages/store/test/store.test.ts b/packages/store/test/store.test.ts
+index 9dc0e030..fd0cca50 100644
+--- a/packages/store/test/store.test.ts
++++ b/packages/store/test/store.test.ts
+@@ -156,7 +156,22 @@ describe("@zsm/store · v2a1+v2a2 durable, crypto-shred event store", () => {
+     expect(cols).toEqual(expected);
+ 
+     const toSnake = (k: string) => k.replace(/[A-Z]/g, (m) => `_${m.toLowerCase()}`);
+-    const contractFields = ["eventId", "learnerRef", "ingestSeq", "latticeEpoch", "verb", "objectGuid", "correct"];
++    // The FULL LearnerEvent contract, including the four optional learning-signal fields. Each of them changes
++    // the fold's learn rate, so each must be persisted (inside the encrypted blob) or a reload would fold to
++    // different mastery — this list is what stops one from being silently dropped again.
++    const contractFields = [
++      "eventId",
++      "learnerRef",
++      "ingestSeq",
++      "latticeEpoch",
++      "verb",
++      "objectGuid",
++      "correct",
++      "scaffold",
++      "metacognition",
++      "encoding",
++      "feedback",
++    ];
+     const covered = [
+       ...CLEARTEXT_CONTRACT_COLUMNS, // already snake_case db names
+       ...ENCRYPTED_CONTRACT_FIELDS.map(toSnake),
+diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml
+index 6021d803..70725065 100644
+--- a/pnpm-lock.yaml
++++ b/pnpm-lock.yaml
+@@ -29,6 +29,9 @@ importers:
+       '@zsm/serving':
+         specifier: workspace:*
+         version: link:../serving
++      '@zsm/store':
++        specifier: workspace:*
++        version: link:../store
+       hono:
+         specifier: ^4.6.14
+         version: 4.12.27
